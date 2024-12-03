@@ -16,11 +16,11 @@ def calculate_cumulants(iq_data):
     I = iq_data[:, :, 0]
     Q = iq_data[:, :, 1]
 
-    # Third-order cumulant (mean of I*Q)
-    third_order = torch.mean(I * Q, dim=1)
+    # 第三阶累积量（I * Q 的均值）
+    third_order = torch.mean(I * Q, dim=1)  # shape: [batch_size]
 
-    # Fourth-order cumulant (mean of I*Q*I)
-    fourth_order = torch.mean(I * Q * I, dim=1)
+    # 第四阶累积量（I * Q * I 的均值）
+    fourth_order = torch.mean(I * Q * I, dim=1)  # shape: [batch_size]
 
     return third_order, fourth_order
 
@@ -49,12 +49,44 @@ class ResidualBlock1D(nn.Module):
         out = self.relu(out)
         return out
 
+# MKL Fusion Module
+class MKLFusion(nn.Module):
+    def __init__(self, input_dim_iq, input_dim_cumulant, num_kernels=4, hidden_dim=128):
+        super(MKLFusion, self).__init__()
+        self.num_kernels = num_kernels
+        # Define multiple transformation paths for IQ features
+        self.iq_kernels = nn.ModuleList([
+            nn.Linear(input_dim_iq, hidden_dim) for _ in range(num_kernels)
+        ])
+        # Define multiple transformation paths for Cumulant features
+        self.cumulant_kernels = nn.ModuleList([
+            nn.Linear(input_dim_cumulant, hidden_dim) for _ in range(num_kernels)
+        ])
+        # Learnable weights for combining kernels
+        self.weights = nn.Parameter(torch.ones(num_kernels) / num_kernels)
 
-# 加入 Transformer 和 LSTM 的 ResNet
-class ResNet1DWithTransformer(nn.Module):
+    def forward(self, iq_features, cumulant_features):
+        kernel_outputs = []
+        for i in range(self.num_kernels):
+            iq_transformed = self.iq_kernels[i](iq_features)
+            cumulant_transformed = self.cumulant_kernels[i](cumulant_features)
+            combined = torch.relu(iq_transformed + cumulant_transformed)
+            kernel_outputs.append(combined)
+        # Stack and apply weights
+        kernel_stack = torch.stack(kernel_outputs, dim=1)  # shape: [batch, num_kernels, hidden_dim]
+        weights = torch.softmax(self.weights, dim=0).unsqueeze(0).unsqueeze(-1)  # shape: [1, num_kernels, 1]
+        fused = torch.sum(kernel_stack * weights, dim=1)  # shape: [batch, hidden_dim]
+        return fused
+
+# 加入 Transformer 和 LSTM 的 ResNet，并使用 MKL 进行特征融合
+class ResNet1DWithTransformerMKL(nn.Module):
     def __init__(self, block, layers, num_classes, input_size, num_heads=4, num_transformer_layers=2, d_model=256,
-                 lstm_hidden_size=128, lstm_num_layers=1, dropout_rate=0.3):
-        super(ResNet1DWithTransformer, self).__init__()
+                 lstm_hidden_size=128, lstm_num_layers=1, dropout_rate=0.0, num_kernels=4, hidden_dim=128):
+        """
+        修改点：
+        - 将 LSTM 的 dropout_rate 设置为 0.0，当 lstm_num_layers=1 时
+        """
+        super(ResNet1DWithTransformerMKL, self).__init__()
         self.in_channels = 64
         # 初始卷积层
         self.conv1 = nn.Conv1d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -72,14 +104,19 @@ class ResNet1DWithTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
 
         # LSTM 层
+        # 如果 lstm_num_layers > 1，则使用 dropout_rate，否则设置为 0
+        effective_dropout = dropout_rate if lstm_num_layers > 1 else 0.0
         self.lstm = nn.LSTM(input_size=d_model, hidden_size=lstm_hidden_size, num_layers=lstm_num_layers,
-                            batch_first=True, dropout=dropout_rate)
+                            batch_first=True, dropout=effective_dropout)
 
         # Dropout 层用于正则化
         self.dropout = nn.Dropout(p=dropout_rate)
 
+        # MKL 融合模块
+        self.mkl_fusion = MKLFusion(input_dim_iq=lstm_hidden_size, input_dim_cumulant=2, num_kernels=num_kernels, hidden_dim=hidden_dim)
+
         # 全连接层用于最终分类
-        self.fc = nn.Linear(lstm_hidden_size + 2, num_classes)  # 融合 IQ 信号 和 高阶累积量特征
+        self.fc = nn.Linear(hidden_dim, num_classes)  # 经过 MKL 融合后的特征直接用于分类
 
     def _make_layer(self, block, out_channels, blocks, stride):
         layers = []
@@ -95,6 +132,8 @@ class ResNet1DWithTransformer(nn.Module):
         """
         # 计算高阶累积量
         third_order, fourth_order = calculate_cumulants(iq_data)
+        # 确保 cumulant_features 具有形状 [batch, 2]
+        cumulant_features = torch.stack((third_order, fourth_order), dim=1)  # shape: [batch, 2]
 
         # IQ 信号通过 ResNet 分支
         x = iq_data.permute(0, 2, 1)  # (batch_size, channels, seq_len)
@@ -111,17 +150,23 @@ class ResNet1DWithTransformer(nn.Module):
 
         # LSTM 层
         x, _ = self.lstm(x)
-        x = x[:, -1, :]  # 取最后一个时间步的输出
+        x = x[:, -1, :]  # 取最后一个时间步的输出，形状: [batch, lstm_hidden_size]
 
-        # 融合 IQ 特征 和 高阶累积量特征
-        cumulant_data = torch.cat((third_order.unsqueeze(1), fourth_order.unsqueeze(1)), dim=1)  # 连接高阶累积量特征
-        combined_features = torch.cat((x, cumulant_data), dim=1)
-        combined_features = self.dropout(combined_features)
+        # 使用 MKL 进行特征融合
+        fused_features = self.mkl_fusion(x, cumulant_features)  # 形状: [batch, hidden_dim]
+        fused_features = self.dropout(fused_features)
 
         # 通过全连接层进行最终分类
-        output = self.fc(combined_features)
+        output = self.fc(fused_features)
         return output
 
+def ResNet18WithTransformer(num_classes, input_size, num_kernels=4, hidden_dim=128):
+    return ResNet1DWithTransformerMKL(
+        block=ResidualBlock1D,
+        layers=[2, 2, 2, 2],
+        num_classes=num_classes,
+        input_size=input_size,
+        num_kernels=num_kernels,
+        hidden_dim=hidden_dim
+    )
 
-def ResNet18WithTransformer(num_classes, input_size):
-    return ResNet1DWithTransformer(ResidualBlock1D, [2, 2, 2, 2], num_classes=num_classes, input_size=input_size)
